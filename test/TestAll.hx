@@ -13,6 +13,7 @@ class TestAll {
     runner.addCase(new TestAuto());
     runner.addCase(new TestParam());
     runner.addCase(new TestPath());
+    runner.addCase(new TestValidation());
 
     // report
     Report.create(runner);
