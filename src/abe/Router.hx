@@ -8,6 +8,7 @@ import express.Express;
 import express.Middleware;
 import express.Router in R;
 import haxe.Constraints.Function;
+import abe.core.RouteProcess;
 #end
 
 class Router {
@@ -28,16 +29,32 @@ class Router {
       expressRouter.use(middleware);
     else
       expressRouter.use(path, middleware);
+    return this;
   }
 
-  public function registerMethod(path : String, method : Method, process : RouteProcess<IRoute, {}>) {
+  public function error(middleware : ErrorMiddleware) {
+    expressRouter.use(middleware);
+    return this;
+  }
+
+  public function registerMethod(path : String, method : Method, process : RouteProcess<IRoute, {}>, ?middlewares : Array<Middleware>, ?errorMiddlewares : Array<ErrorMiddleware>) {
+    var args : Array<Dynamic> = [path];
+    if(null != middlewares) {
+      args = args.concat(middlewares);
+    }
+    args.push(process.run);
+    if(null != errorMiddlewares) {
+      args = args.concat(errorMiddlewares);
+    }
     Reflect.callMethod(
       expressRouter,
-      Reflect.field(expressRouter, method), [
-        path,
-        process.run
-      ]
-    );
+      Reflect.field(expressRouter, method), args);
+    return this;
+  }
+
+  public function serve(path : String, root : String, ?options : express.StaticOptions) {
+    expressRouter.use(path, Express.serveStatic(root, options));
+    return this;
   }
 #end
   macro public function register(_this : Expr, instance : Expr)

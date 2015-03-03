@@ -1,5 +1,6 @@
 package abe.core.macros;
 
+import haxe.macro.ExprTools;
 import haxe.macro.Type;
 import haxe.macro.Context;
 import haxe.macro.Expr;
@@ -12,30 +13,47 @@ using thx.core.Strings;
 class AutoRegisterRoute {
   public static function register(router : Expr, instance : Expr) : Expr {
     var type = getClassType(instance),
-        prefix = getPrefix(type.meta.get(), type.pos);
-
+        prefix = getPrefix(type.meta.get(), type.pos),
+        pos  = type.pos,
+        meta = type.meta.get(),
+        uses = getUses(meta),
+        errors = getErrors(meta),
+        filters = getFilters(meta);
     // iterate on all the fields and filter the functions that have @:{method}
     var fields = filterControllerMethods(type.fields.get());
 
     var definitions = fields.map(function(field) {
         var metadata = field.meta.get(),
-            metas    = findMetaFromNames(metadata, abe.Methods.list);
+            metas    = findMetaFromNames(metadata, abe.Methods.list),
+            uses     = getUses(metadata),
+            errors   = getErrors(metadata),
+            filters  = getFilters(metadata);
 
         return metas.map(function(meta) {
           return {
             name: field.name,
-            path: prefix + getMetaAsString(meta, 0),
+            path: getMetaAsString(meta, 0),
             args: getArguments(field),
-            method: meta.name.substring(1)
+            method: meta.name.substring(1),
+            uses: uses.map(ExprTools.toString),
+            errors: errors.map(ExprTools.toString),
+            filters: filters.map(ExprTools.toString)
           }
         });
       }).flatten();
 
-    if(definitions.length == 0) {
-      Context.error("There are no controller methods defined in this class", Context.currentPos());
+    var exprs = [macro var router = parent.mount($v{prefix})];
+
+    exprs = exprs.concat(uses.map(
+      function(use) return macro router.use("/", $e{use})));
+
+    if(filters.length > 0) {
+      var sfilters = filters.map(ExprTools.toString);
+      exprs.push(Context.parse('var commonFilters = [${sfilters.join(", ")}]',
+          Context.currentPos()));
     }
 
-    var exprs = definitions.map(function(definition) {
+    exprs = exprs.concat(definitions.map(function(definition) {
       // create a class type for each controller function
       var processName = [type.name, definition.name, "RouteProcess"].join("_");
       var fullName = type.pack.concat([processName]).join("."),
@@ -43,6 +61,16 @@ class AutoRegisterRoute {
 
       exprs.push(Context.parse('var filters = new abe.core.ArgumentsFilter()',
                 Context.currentPos()));
+      if(filters.length > 0) {
+        filters
+          .map(ExprTools.toString)
+          .map(function(filter) {
+            exprs.push(Context.parse('filters.addFilter($filter)',
+              Context.currentPos()));
+          });
+      }
+      for(filter in definition.filters)
+        exprs.push(Context.parse('filters.addFilter($filter)', pos));
       var args = definition.args.map(function(arg) {
               var sources = arg.sources.map(function(s) return '"$s"').join(", ");
               return '{
@@ -52,23 +80,19 @@ class AutoRegisterRoute {
                 sources : [$sources]
               }';
             }).join(", "),
-          emptyArgs = definition.args.map(function(arg) {
-              return '${arg.name} : null';
-            }).join(", ");
-      exprs.push(Context.parse('var processor = new abe.core.ArgumentProcessor(filters, [${args}])',
-                Context.currentPos()));
-      exprs.push(Context.parse('var process = new $fullName({ $emptyArgs }, instance, processor)',
-                Context.currentPos()));
+          emptyArgs = definition.args.map(function(arg) return '${arg.name} : null').join(", ");
+      exprs.push(Context.parse('var processor = new abe.core.ArgumentProcessor(filters, [${args}])', pos));
+      exprs.push(Context.parse('var process = new $fullName({ $emptyArgs }, instance, processor)', pos));
+      exprs.push(Context.parse('router.registerMethod("${definition.path}", "${definition.method}", cast process, [${definition.uses.join(", ")}], [${definition.errors.join(", ")}])', pos));
 
-      var path = definition.path,
-          method = definition.method;
-      exprs.push(macro router.registerMethod($v{path}, $v{method}, cast process));
-
-      var params = definition.args.map(function(arg) : Field return {
+      var params = definition.args.map(function(arg) : Field{
+          var kind = complexTypeFromString(arg.type);
+          return {
             pos : Context.currentPos(),
             name : arg.name,
-            kind : FVar(Context.follow(Context.getType(arg.type)).toComplexType())
-          });
+            kind : FVar(kind)
+          };
+        });
 
       if(null == try Context.getType(processName) catch(e : Dynamic) null) {
         var fields = createProcessFields(definition.name, definition.args);
@@ -77,7 +101,7 @@ class AutoRegisterRoute {
             pack : type.pack,
             name : processName,
             kind : TDClass({
-                pack : ["abe"],
+                pack : ["abe", "core"],
                 name : "RouteProcess",
                 params : [
                   TPType(TPath({
@@ -91,25 +115,49 @@ class AutoRegisterRoute {
           });
       }
 
-      // pass additional filters
-      return macro $b{exprs};
-    });
+      return exprs;
+    }).flatten());
 
-    // registerMethod(path, method, router)
-    return macro (function(instance, router) {
+  exprs = exprs.concat(errors.map(
+    function(error) return macro router.error($e{error})));
+
+  exprs.push(macro return router);
+    var result = macro (function(instance, parent : abe.Router)
       $b{exprs}
-    })($instance, $router);
+    )($instance, $router);
+    return result;
   }
+
+  static function complexTypeFromString(s : String) : ComplexType {
+    return switch Context.parse('(_:$s)', Context.currentPos()) {
+      case { expr : EParenthesis({ expr : ECheckType(_, t) }) }: t;
+      case _: throw 'screw you';
+    };
+  }
+
+  static function getEntries(name : String, meta : Array<MetadataEntry>) {
+    var m = findMeta(meta, name);
+    if(null == m) return [];
+    return m.params;
+  }
+
+  static function getUses(meta : Array<MetadataEntry>)
+    return getEntries(":use", meta);
+
+  static function getErrors(meta : Array<MetadataEntry>)
+    return getEntries(":error", meta);
+
+  static function getFilters(meta : Array<MetadataEntry>)
+    return getEntries(":filter", meta);
 
   static function getPrefix(meta : Array<MetadataEntry>, pos) {
     var m = findMeta(meta, ":path");
-    if(null == m) return "";
+    if(null == m) return "/";
     if(m.params.length != 1)
       Context.error("@:path() should only contain one string", pos);
     return switch m.params[0].expr {
       case EConst(CString(path)):
-        path = path.trimChars('/');
-        path.length == 0 ? "" : '/$path';
+        path;
       case _:
         Context.error("@:path() should use a string", pos);
     };
@@ -180,8 +228,8 @@ class AutoRegisterRoute {
       case _:
         Context.error("parameter for query should be an identifier or an array of identifiers", field.pos);
     }).flatten();
-    sources.map(function(source) switch source {
-        case "query", "params", "body":
+    sources.map(function(source : Source) switch source {
+        case Query, Params, Body, Request:
         case _: Context.error('"$source" is not a valid @:source()', field.pos);
       });
     return sources;
